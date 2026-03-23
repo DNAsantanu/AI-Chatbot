@@ -1,0 +1,224 @@
+// AI ChatBot - CI/CD Pipeline (GCP)
+// Jenkins Declarative Pipeline: Build, test, push to Artifact Registry, deploy to Cloud Run
+
+pipeline {
+    agent any
+
+    environment {
+        // GCP Configuration
+        GCP_PROJECT_ID     = credentials('gcp-project-id')
+        GCP_REGION         = 'us-central1'
+        GCP_SA_KEY         = credentials('gcp-service-account-key')
+        AR_REPO            = "${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/ai-chatbot-repo"
+
+        // SonarQube
+        SONAR_HOST_URL     = credentials('sonar-host-url')
+        SONAR_TOKEN        = credentials('sonar-token')
+
+        // Image tags
+        IMAGE_TAG          = "${env.BUILD_NUMBER}-${env.GIT_COMMIT?.take(7) ?: 'latest'}"
+    }
+
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
+    stages {
+        // ──────────────────────────────────────
+        // Stage 1: Checkout
+        // ──────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                checkout scm
+                echo "Building commit: ${env.GIT_COMMIT}"
+            }
+        }
+
+        // ──────────────────────────────────────
+        // Stage 2: Install Dependencies
+        // ──────────────────────────────────────
+        stage('Install Dependencies') {
+            steps {
+                sh '''
+                    python3 -m venv venv
+                    . venv/bin/activate
+                    pip install --upgrade pip
+                    pip install -r requirements.txt
+                '''
+            }
+        }
+
+        // ──────────────────────────────────────
+        // Stage 3: Linting
+        // ──────────────────────────────────────
+        stage('Lint') {
+            steps {
+                sh '''
+                    . venv/bin/activate
+                    pip install ruff
+                    ruff check backend/ tests/ --output-format=github
+                '''
+            }
+        }
+
+        // ──────────────────────────────────────
+        // Stage 4: Unit Tests
+        // ──────────────────────────────────────
+        stage('Test') {
+            steps {
+                sh '''
+                    . venv/bin/activate
+                    python -m pytest tests/ -v \
+                        --tb=short \
+                        --junitxml=reports/test-results.xml \
+                        --cov=backend \
+                        --cov-report=xml:reports/coverage.xml \
+                        --cov-report=html:reports/htmlcov
+                '''
+            }
+            post {
+                always {
+                    junit 'reports/test-results.xml'
+                    publishHTML([
+                        reportDir: 'reports/htmlcov',
+                        reportFiles: 'index.html',
+                        reportName: 'Coverage Report'
+                    ])
+                }
+            }
+        }
+
+        // ──────────────────────────────────────
+        // Stage 5: SonarQube Analysis
+        // ──────────────────────────────────────
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh '''
+                        sonar-scanner \
+                            -Dsonar.projectKey=ai-chatbot \
+                            -Dsonar.sources=backend \
+                            -Dsonar.tests=tests \
+                            -Dsonar.python.coverage.reportPaths=reports/coverage.xml \
+                            -Dsonar.host.url=${SONAR_HOST_URL} \
+                            -Dsonar.login=${SONAR_TOKEN}
+                    '''
+                }
+            }
+        }
+
+        // ──────────────────────────────────────
+        // Stage 6: Quality Gate
+        // ──────────────────────────────────────
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        // ──────────────────────────────────────
+        // Stage 7: Authenticate with GCP
+        // ──────────────────────────────────────
+        stage('GCP Auth') {
+            steps {
+                sh '''
+                    echo "${GCP_SA_KEY}" > /tmp/gcp-key.json
+                    gcloud auth activate-service-account --key-file=/tmp/gcp-key.json
+                    gcloud config set project ${GCP_PROJECT_ID}
+                    gcloud auth configure-docker ${GCP_REGION}-docker.pkg.dev --quiet
+                '''
+            }
+        }
+
+        // ──────────────────────────────────────
+        // Stage 8: Docker Build & Push
+        // ──────────────────────────────────────
+        stage('Docker Build & Push') {
+            parallel {
+                stage('Backend') {
+                    steps {
+                        sh """
+                            docker build \
+                                -f docker/Dockerfile.backend \
+                                -t ${AR_REPO}/ai-chatbot-backend:${IMAGE_TAG} \
+                                -t ${AR_REPO}/ai-chatbot-backend:latest \
+                                .
+                            docker push ${AR_REPO}/ai-chatbot-backend:${IMAGE_TAG}
+                            docker push ${AR_REPO}/ai-chatbot-backend:latest
+                        """
+                    }
+                }
+                stage('Frontend') {
+                    steps {
+                        sh """
+                            docker build \
+                                -f docker/Dockerfile.frontend \
+                                -t ${AR_REPO}/ai-chatbot-frontend:${IMAGE_TAG} \
+                                -t ${AR_REPO}/ai-chatbot-frontend:latest \
+                                .
+                            docker push ${AR_REPO}/ai-chatbot-frontend:${IMAGE_TAG}
+                            docker push ${AR_REPO}/ai-chatbot-frontend:latest
+                        """
+                    }
+                }
+            }
+        }
+
+        // ──────────────────────────────────────
+        // Stage 9: Deploy to Cloud Run
+        // ──────────────────────────────────────
+        stage('Deploy to Cloud Run') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sh """
+                    gcloud run deploy ai-chatbot-backend \
+                        --image=${AR_REPO}/ai-chatbot-backend:${IMAGE_TAG} \
+                        --region=${GCP_REGION} \
+                        --platform=managed \
+                        --allow-unauthenticated \
+                        --port=8000 \
+                        --cpu=1 --memory=512Mi \
+                        --min-instances=0 --max-instances=3 \
+                        --quiet
+
+                    BACKEND_URL=\$(gcloud run services describe ai-chatbot-backend \
+                        --region=${GCP_REGION} --format='value(status.url)')
+
+                    gcloud run deploy ai-chatbot-frontend \
+                        --image=${AR_REPO}/ai-chatbot-frontend:${IMAGE_TAG} \
+                        --region=${GCP_REGION} \
+                        --platform=managed \
+                        --allow-unauthenticated \
+                        --port=8501 \
+                        --cpu=1 --memory=512Mi \
+                        --min-instances=0 --max-instances=3 \
+                        --set-env-vars="BACKEND_URL=\${BACKEND_URL}" \
+                        --quiet
+
+                    echo "✅ Backend:  \${BACKEND_URL}"
+                    echo "✅ Frontend: \$(gcloud run services describe ai-chatbot-frontend \
+                        --region=${GCP_REGION} --format='value(status.url)')"
+                """
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "✅ Pipeline completed successfully! Image tag: ${IMAGE_TAG}"
+        }
+        failure {
+            echo "❌ Pipeline failed. Check the logs above."
+        }
+        always {
+            sh 'rm -f /tmp/gcp-key.json'
+            cleanWs()
+        }
+    }
+}
